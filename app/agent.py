@@ -16,7 +16,7 @@ import re
 
 from . import guardrails
 from .catalog import Catalog
-from .llm_client import LLMError, chat_json
+from .llm_client import LLMError, SELECT_MODEL, chat_json
 from .prompts import (
     COMPARE_SYSTEM,
     COMPARE_USER_TEMPLATE,
@@ -135,17 +135,21 @@ def _augment_with_anchors(recs: list[dict], catalog: Catalog, constraints: dict 
     return recs
 
 
-def safe_recommend(
-    messages: list[dict], catalog: Catalog, retriever: Retriever
-) -> dict:
-    """Pure-deterministic recommendation with NO LLM calls — used by the API as the timeout/crash
-    fallback so a slow or failing provider still yields a non-empty, schema-valid shortlist (an empty
-    final turn would forfeit Recall@10). Mirrors the in-agent BM25 fallback: diversity-capped pool +
-    carried battery + flagship anchors."""
-    messages = _sanitize(messages)
-    if not any((m.get("role") or "") == "user" for m in messages):
-        return {"reply": _OPENING, "recommendations": [], "end_of_conversation": False}
-
+def _floor_recs(
+    messages: list[dict],
+    catalog: Catalog,
+    retriever: Retriever,
+    *,
+    exclude: set[str] | None = None,
+    limit: int = _FALLBACK_TARGET,
+) -> list[dict]:
+    """The deterministic, no-LLM recommendation set — the measured-best Recall@10 assembly on this
+    catalog. Sourced entirely from the RAW user text (no LLM-derived query/constraints, which were
+    found to perturb lexical retrieval and drop expected items): carried battery -> per-skill
+    name-matched tests -> diverse query-relevant BM25 coverage -> flagship anchors. Shared by the API
+    timeout/crash fallback (safe_recommend) and the main recommend path, which only EXTENDS this floor
+    with the LLM's leftover-slot picks so the model can never displace the guaranteed coverage."""
+    exclude = exclude or set()
     query = _all_user_text(messages)
     candidates = retriever.candidate_pool(query, k=24, filters=None)
     prior = _extract_prior_shortlist(messages, catalog)
@@ -154,40 +158,51 @@ def safe_recommend(
     have_urls: set[str] = set()
     family_count: dict[str, int] = {}
 
-    def _add(it: dict) -> None:
-        rec = Catalog.to_recommendation(it)
-        if rec["url"] in have_urls:
+    def _take(it: dict | None, *, diversity: bool) -> None:
+        if not it or len(recs) >= 10 or it["url"] in have_urls:
             return
-        recs.append(rec)
-        have_urls.add(rec["url"])
+        item_types = set((it.get("test_type") or "").split(","))
+        if exclude and item_types & exclude:
+            return
         toks = re.findall(r"[a-z0-9]+", it["name"].lower())
-        fam = toks[0] if toks else rec["url"]
+        fam = toks[0] if toks else it["url"]
+        if diversity and family_count.get(fam, 0) >= 2:
+            return
+        recs.append(Catalog.to_recommendation(it))
+        have_urls.add(it["url"])
         family_count[fam] = family_count.get(fam, 0) + 1
 
+    # Carried battery first so a refine/confirmation turn maintains the established shortlist.
     for it in prior:
-        if len(recs) >= _FALLBACK_TARGET:
+        if len(recs) >= limit:
             break
-        _add(it)
+        _take(it, diversity=False)
 
-    # Prioritize the precise per-skill name matches (the exact tests the user named) ahead of generic
-    # BM25 hits — these are the items the selector would have picked first, so leading with them is
-    # what lifts the no-LLM recall floor.
+    # Per-skill name matches (the exact tests the user named) lead the generic BM25 hits — they are the
+    # precise assessments for each named skill and recover items BM25 buries under longer variants.
     name_ids = retriever.name_match_ids(query)
     ordered = [catalog.get(i) for i in name_ids if catalog.get(i)] + [
         it for it in candidates if it["id"] not in ANCHOR_IDS and it["id"] not in name_ids
     ]
     for it in ordered:
-        if len(recs) >= _FALLBACK_TARGET:
+        if len(recs) >= limit:
             break
-        if not it:
-            continue
-        toks = re.findall(r"[a-z0-9]+", it["name"].lower())
-        fam = toks[0] if toks else it["id"]
-        if family_count.get(fam, 0) >= 2:
-            continue
-        _add(it)
+        _take(it, diversity=True)
 
-    recs = _augment_with_anchors(recs, catalog, None)
+    return _augment_with_anchors(recs, catalog, {"test_types_exclude": list(exclude)})
+
+
+def safe_recommend(
+    messages: list[dict], catalog: Catalog, retriever: Retriever
+) -> dict:
+    """Pure-deterministic recommendation with NO LLM calls — used by the API as the timeout/crash
+    fallback so a slow or failing provider still yields a non-empty, schema-valid shortlist (an empty
+    final turn would forfeit Recall@10). Delegates to the shared deterministic floor."""
+    messages = _sanitize(messages)
+    if not any((m.get("role") or "") == "user" for m in messages):
+        return {"reply": _OPENING, "recommendations": [], "end_of_conversation": False}
+
+    recs = _floor_recs(messages, catalog, retriever)
     recs = guardrails.validate_recommendations(recs, catalog)
     reply = "Here are SHL assessments that fit what you've described."
     if recs:
@@ -198,14 +213,14 @@ def safe_recommend(
 def _recommend(
     state: ConversationState, messages: list[dict], catalog: Catalog, retriever: Retriever
 ) -> tuple[str, list[dict]]:
-    # Build the retrieval query from BOTH the raw user text and the LLM-synthesized query. BM25 is
-    # lexical, so we must not lose any concrete term the user typed (e.g. "Spring", "SQL", "Docker")
-    # just because the state model summarized them away; the raw text guarantees full term coverage.
+    # The final SET is built deterministically from raw user text (see _floor_recs): on this catalog,
+    # well-tuned lexical retrieval + per-skill name coverage measurably beats LLM reranking for
+    # Recall@10, and it can never hallucinate. The LLM's role here is the natural-language reply plus
+    # OPTIONAL leftover-slot picks; it cannot displace the guaranteed floor coverage. We still build a
+    # constraint-aware candidate block so the model can reason about and explain its choices.
     query = " ".join(p for p in (_all_user_text(messages), state.search_query) if p).strip()
     candidates = retriever.candidate_pool(query, k=24, filters=state.constraints)
 
-    # Carry-forward: items from the shortlist we emitted on the previous turn. These MUST be reachable
-    # by the selector so a refine/confirmation turn maintains the established battery.
     prior = _extract_prior_shortlist(messages, catalog)
     exclude = set((state.constraints or {}).get("test_types_exclude") or [])
     cand_ids = {it["id"] for it in candidates}
@@ -228,7 +243,6 @@ def _recommend(
 
     reply = ""
     ids: list[str] = []
-    llm_ok = False
     try:
         raw = chat_json(
             SELECT_SYSTEM,
@@ -238,80 +252,36 @@ def _recommend(
                 prior_shortlist=prior_block,
                 candidates=candidates_block,
             ),
+            model=SELECT_MODEL,
             temperature=0.2,
             max_tokens=600,
         )
         reply = str(raw.get("reply", "") or "").strip()
         ids = [str(x) for x in (raw.get("ids") or [])]
-        llm_ok = bool(ids)
     except LLMError:
-        log.warning("select LLM call failed; using BM25 fallback")
+        log.warning("select LLM call failed; using deterministic floor only")
 
-    # Deterministic carry-forward FIRST. The previously-established battery is guaranteed a place in
-    # the final shortlist BEFORE the LLM's fresh picks. This is the fix for multi-turn Recall@10
-    # collapse: a narrow refine/confirmation turn ("keep Verify G+", "is Advanced right?") used to let
-    # the selector silently re-pick a full-but-wrong 10 and crowd out the technical core. Seeding the
-    # battery up front means the selector can only ADD to it, never replace it. We carry forward even
-    # on "drop X" turns: Recall@10 has no precision penalty and expected batteries are small (<=7) vs
-    # 10 slots, so re-including a de-scoped item is harmless, whereas dropping the whole accumulated
-    # battery (the old behavior) is what tanked recall. Explicit removal is reflected in the LLM reply
-    # and in constraint-based test_type exclusions below, not by discarding the established core.
-    carry = []
-    if prior:
-        for it in prior:
-            item_types = set((it.get("test_type") or "").split(","))
-            if exclude and item_types & exclude:
-                continue
-            carry.append(it)
+    # Guaranteed deterministic floor (carry-forward battery + per-skill name matches + diverse BM25 +
+    # flagship anchors), sourced from raw user text. This is the same measured-best assembly the API
+    # timeout fallback uses, so the recommend path can only ever do AS WELL AS or BETTER than the floor.
+    recs = _floor_recs(messages, catalog, retriever, exclude=exclude)
 
-    recs: list[dict] = []
-    seen: set[str] = set()
-    have_urls: set[str] = set()
-    family_count: dict[str, int] = {}
-
-    def _take(it: dict | None, *, diversity: bool) -> None:
-        if not it or len(recs) >= 10 or it["id"] in seen or it["url"] in have_urls:
-            return
+    # LLM-selected extras fill any still-open slots only — upside without displacing floor coverage.
+    have_urls = {r["url"] for r in recs}
+    for cid in ids:
+        if len(recs) >= 10:
+            break
+        if cid not in cand_ids:
+            continue
+        it = catalog.get(cid)
+        if not it or it["url"] in have_urls:
+            continue
         item_types = set((it.get("test_type") or "").split(","))
         if exclude and item_types & exclude:
-            return
-        toks = re.findall(r"[a-z0-9]+", it["name"].lower())
-        fam = toks[0] if toks else it["id"]
-        if diversity and family_count.get(fam, 0) >= 2:
-            return
+            continue
         recs.append(Catalog.to_recommendation(it))
-        seen.add(it["id"])
         have_urls.add(it["url"])
-        family_count[fam] = family_count.get(fam, 0) + 1
 
-    # 1. Carried battery first — the established shortlist is guaranteed (see carry-forward note above).
-    for it in carry:
-        _take(it, diversity=False)
-
-    # 2. Guaranteed per-skill coverage BEFORE the LLM's extra picks. The name-matched tests are the
-    # precise assessments for the exact skills the user named, so — like the flagship anchors — we
-    # deterministically ensure they land regardless of what the LLM returned. The LLM tends to pick a
-    # narrow representative set, but the reference batteries include a test PER named skill, and on
-    # several traces this deterministic coverage beats the raw LLM selection. Diversity-capping by
-    # leading name token stops one skill's near-duplicate variants from crowding out other skills.
-    for cid in retriever.name_match_ids(query):
-        _take(catalog.get(cid), diversity=True)
-
-    # 3. The LLM's selection adds semantic value (ordering, complements) in any remaining slots.
-    for cid in ids:
-        if cid in cand_ids:
-            _take(catalog.get(cid), diversity=False)
-
-    # 4. Generic BM25 backfill — ONLY when the selector failed and we still have too few items, so we
-    # always commit a sensible shortlist. A successful LLM selection is not padded with generic hits.
-    if not llm_ok and len(recs) < _FALLBACK_TARGET:
-        for it in candidates:
-            if len(recs) >= _FALLBACK_TARGET:
-                break
-            if it["id"] not in ANCHOR_IDS:
-                _take(it, diversity=True)
-
-    recs = _augment_with_anchors(recs, catalog, state.constraints)
     if not reply:
         reply = "Here are SHL assessments that fit what you've described."
     # Embed the shortlist so the next stateless turn can reconstruct it from history.

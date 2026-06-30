@@ -19,6 +19,12 @@ DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 # pool doing the heavy lifting, 8B selection quality is more than adequate, and the larger budget is
 # what keeps a graded deployment from exhausting its daily tokens. Swap to 70B via GROQ_MODEL.
 STATE_MODEL = os.getenv("GROQ_STATE_MODEL", "llama-3.1-8b-instant")
+# The heavier selection call can be pointed at a different model than the state call. Keeping them
+# on separate models matters on Groq's free tier because each model has its own tokens-per-minute
+# bucket: running state on 8B and select on 70B means the ~2.8k-token select prompt no longer
+# competes with the state call for the 8B's 6k TPM, which otherwise forces fallbacks under load.
+# Defaults to the same 8B model so a single GROQ_MODEL still configures everything in one place.
+SELECT_MODEL = os.getenv("GROQ_SELECT_MODEL", DEFAULT_MODEL)
 # Per-call wall clock kept well under the grader's 30s/turn so two calls + retrieval still fit.
 REQUEST_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "10"))
 MAX_ATTEMPTS = int(os.getenv("GROQ_MAX_ATTEMPTS", "2"))

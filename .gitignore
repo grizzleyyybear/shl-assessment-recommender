@@ -5,4 +5,5 @@ __pycache__/
 venv/
 .pytest_cache/
 eval/eval_report.md
+eval_full_run.txt
 *.log
