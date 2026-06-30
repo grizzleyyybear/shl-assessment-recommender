@@ -69,6 +69,7 @@ class Retriever:
         self._docs_tokens = [tokenize(self._doc(it)) for it in catalog.items]
         self.bm25 = BM25Okapi(self._docs_tokens)
         self._prefix_index = self._build_prefix_index()
+        self._name_index = self._build_name_index()
 
     @staticmethod
     def _doc(it: dict) -> str:
@@ -80,6 +81,55 @@ class Retriever:
             keys, keys,
             levels,
         ])
+
+    def _build_name_index(self) -> dict[str, list[str]]:
+        """Inverted index from a significant NAME token -> ids whose name contains it.
+
+        A long multi-skill JD ("Java, Spring, SQL, AWS, Docker, ...") dilutes BM25 so short,
+        single-skill knowledge tests ("SQL Server (New)", "Docker (New)", "Linux Programming
+        (General)") fall below the top-k cut even though they are exactly what the user named. This
+        per-token index lets us deterministically pull in the precise skill test for every concrete
+        term the user typed, which is the single biggest lever on candidate recall here.
+        """
+        index: dict[str, list[str]] = {}
+        for it in self.catalog.items:
+            for tok in set(_sig_tokens(it["name"])):
+                if len(tok) < 3:
+                    continue
+                index.setdefault(tok, []).append(it["id"])
+        # Drop tokens so common they carry no discriminating signal (would flood the pool).
+        return {tok: ids for tok, ids in index.items() if len(ids) <= 25}
+
+    def _name_matches(self, query: str, per_token: int = 4, total_cap: int = 22) -> list[str]:
+        """Ids whose name contains a significant token from the query, ranked by query relevance.
+
+        Within each token bucket we order by the item's BM25 score for the FULL query, so e.g. for a
+        contact-centre query naming "english"/"us" the right "SVAR - Spoken English (US)" outranks
+        generic "...English..." tests that merely share the one word.
+        """
+        q_norm = tokenize(query)
+        if not q_norm:
+            return []
+        scores = self.bm25.get_scores(q_norm)
+        id_to_score = {it["id"]: scores[i] for i, it in enumerate(self.catalog.items)}
+        q_tokens = [t for t in dict.fromkeys(q_norm) if len(t) >= 3]
+        out: list[str] = []
+        seen: set[str] = set()
+        for tok in q_tokens:
+            ids = self._name_index.get(tok)
+            if not ids:
+                continue
+            by_score = sorted(ids, key=lambda i: -id_to_score.get(i, 0.0))[:per_token]
+            # Also keep the most-specific lexical hits (shortest names, e.g. "SQL (New)") which a
+            # full-query BM25 ranking can bury under longer multi-skill variants.
+            by_len = sorted(ids, key=lambda i: len(self.catalog.get(i)["name"]))[:2]
+            for cid in list(dict.fromkeys(by_score + by_len)):
+                if cid not in seen:
+                    seen.add(cid)
+                    out.append(cid)
+                if len(out) >= total_cap:
+                    return out
+        return out
 
     def _build_prefix_index(self) -> dict[tuple, list[str]]:
         """Map the first two significant name tokens -> ids, for report-variant sibling lookup.
@@ -163,6 +213,11 @@ class Retriever:
 
         for it in self.search(query, k=k, filters=filters):
             add(it)
+
+        # Deterministic per-skill recovery: pull in the precise knowledge test for every concrete
+        # term the user named, which a long diluted BM25 query otherwise buries below the cut.
+        for cid in self._name_matches(query):
+            add(self.catalog.get(cid))
 
         if include_anchors:
             for aid in ANCHOR_IDS:
