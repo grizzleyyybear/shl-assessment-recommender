@@ -1,18 +1,11 @@
-"""Pydantic models mirroring the non-negotiable API contract exactly.
-
-Response shape (verbatim from the spec):
-    { "reply": str,
-      "recommendations": [ {"name": str, "url": str, "test_type": str}, ... ],
-      "end_of_conversation": bool }
-"""
+"""API request/response models."""
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
 
 class Message(BaseModel):
-    # role is kept permissive (str, not Literal) so a malformed history never 422s the endpoint;
-    # we sanitize roles in the agent instead of rejecting the request.
+    # role stays a plain str so a malformed history never 422s; the agent sanitizes it.
     role: str = ""
     content: str = ""
 

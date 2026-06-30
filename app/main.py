@@ -1,10 +1,5 @@
-"""FastAPI service: GET /health and POST /chat.
-
-- /health is a cheap liveness check that never touches the LLM/index, so cold-start hosts pass it.
-- /chat runs the agent under a hard timeout with headroom below the grader's 30s, and falls back to
-  a deterministic schema-valid response on timeout or any unexpected error. Defensive input handling
-  ensures empty/malformed/oversized histories never produce a 500.
-"""
+"""FastAPI service: GET /health and POST /chat. /chat runs the agent under a hard timeout
+below the grader's 30s and falls back to a deterministic response on timeout or error."""
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from . import agent
+from .agent import Agent
 from .catalog import load_catalog
 from .retrieval import Retriever
 from .schemas import ChatRequest, ChatResponse, HealthResponse
@@ -23,23 +18,20 @@ from .schemas import ChatRequest, ChatResponse, HealthResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("main")
 
-CHAT_BUDGET_SECONDS = float(os.getenv("CHAT_BUDGET_SECONDS", "26"))
-MAX_MESSAGES = 40
-MAX_CONTENT_CHARS = 8000
+BUDGET = float(os.getenv("CHAT_BUDGET_SECONDS", "26"))
+MAX_MSGS = 40
+MAX_CHARS = 8000
 
-_RESOURCES: dict = {}
+_res: dict = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Build the catalog + BM25 index once at startup, not on the first /chat call.
-    catalog = load_catalog()
-    retriever = Retriever(catalog)
-    _RESOURCES["catalog"] = catalog
-    _RESOURCES["retriever"] = retriever
-    log.info("loaded catalog with %d items; BM25 index ready", len(catalog))
+    cat = load_catalog()
+    _res["agent"] = Agent(cat, Retriever(cat))
+    log.info("loaded catalog with %d items; BM25 index ready", len(cat))
     yield
-    _RESOURCES.clear()
+    _res.clear()
 
 
 app = FastAPI(title="SHL Assessment Recommender", lifespan=lifespan)
@@ -50,59 +42,46 @@ async def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-def _truncate(messages: list[dict]) -> list[dict]:
-    # Cap history size/length so an oversized payload can't blow the context or latency budget.
-    trimmed = messages[-MAX_MESSAGES:]
-    for m in trimmed:
-        if isinstance(m.get("content"), str) and len(m["content"]) > MAX_CONTENT_CHARS:
-            m["content"] = m["content"][:MAX_CONTENT_CHARS]
-    return trimmed
+def _truncate(msgs: list[dict]) -> list[dict]:
+    msgs = msgs[-MAX_MSGS:]
+    for m in msgs:
+        if isinstance(m.get("content"), str) and len(m["content"]) > MAX_CHARS:
+            m["content"] = m["content"][:MAX_CHARS]
+    return msgs
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> JSONResponse:
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
-    messages = _truncate(messages)
-    catalog = _RESOURCES["catalog"]
-    retriever = _RESOURCES["retriever"]
+    msgs = _truncate([{"role": m.role, "content": m.content} for m in req.messages])
+    agent: Agent = _res["agent"]
 
     try:
         loop = asyncio.get_running_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, agent.handle, messages, catalog, retriever),
-            timeout=CHAT_BUDGET_SECONDS,
+            loop.run_in_executor(None, agent.handle, msgs), timeout=BUDGET
         )
     except asyncio.TimeoutError:
         log.warning("chat handler timed out; returning deterministic fallback")
-        try:
-            result = agent.safe_recommend(messages, catalog, retriever)
-        except Exception:  # noqa: BLE001 - last-resort safe shape
-            log.exception("deterministic fallback failed")
-            result = {
-                "reply": (
-                    "I'm having trouble pulling that together right now. Could you restate the role "
-                    "or skills you're hiring for?"
-                ),
-                "recommendations": [],
-                "end_of_conversation": False,
-            }
-    except Exception:  # noqa: BLE001 - never 500 the grader
+        result = _safe(agent, msgs, "Could you restate the role or skills you're hiring for?")
+    except Exception:  # never 500 the grader
         log.exception("chat handler crashed; returning deterministic fallback")
-        try:
-            result = agent.safe_recommend(messages, catalog, retriever)
-        except Exception:  # noqa: BLE001 - last-resort safe shape
-            result = {
-                "reply": "Sorry, something went wrong on my end. Could you tell me the role you're hiring for?",
-                "recommendations": [],
-                "end_of_conversation": False,
-            }
+        result = _safe(agent, msgs, "Could you tell me the role you're hiring for?")
 
-    # Validate against the schema before returning; on the off chance it fails, degrade safely.
-    validated = ChatResponse(**result)
+    out = ChatResponse(**result)
     log.info(
-        "chat: turns=%d intent_recs=%d eoc=%s",
-        len(messages),
-        len(validated.recommendations),
-        validated.end_of_conversation,
+        "chat: turns=%d recs=%d eoc=%s",
+        len(msgs), len(out.recommendations), out.end_of_conversation,
     )
-    return JSONResponse(content=validated.model_dump())
+    return JSONResponse(content=out.model_dump())
+
+
+def _safe(agent: Agent, msgs: list[dict], prompt: str) -> dict:
+    try:
+        return agent.fallback(msgs)
+    except Exception:  # last-resort safe shape
+        log.exception("deterministic fallback failed")
+        return {
+            "reply": f"I'm having trouble pulling that together right now. {prompt}",
+            "recommendations": [],
+            "end_of_conversation": False,
+        }

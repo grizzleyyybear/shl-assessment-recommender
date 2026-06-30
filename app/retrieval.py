@@ -1,21 +1,10 @@
-"""Lexical retrieval over the catalog using BM25, plus a recall-oriented candidate pool.
+"""BM25 lexical retrieval over the catalog plus a recall-oriented candidate pool.
 
-Why BM25 + LLM rerank (and no local embedding model):
-- The catalog is ~380 short, structured items whose matching signal is overwhelmingly lexical
-  (skill names like "Java", "SQL", "OPQ", "Docker"). In offline tests BM25 actually BEAT a
-  bge-small semantic index here (0.51 vs 0.42 candidate recall @15), so a sentence-transformer
-  would add ~400MB + cold-start cost on Render for negative gain. The LLM is our semantic layer.
-
-Why a curated candidate pool on top of raw BM25:
-- The reference traces show the agent reliably complements role-specific knowledge tests with a few
-  SHL "flagship" instruments (OPQ32r personality, a Verify cognitive test, Graduate Scenarios) and
-  occasionally their sibling reports (OPQ Universal Competency, Global Skills Development Report).
-  These are semantically related but lexically dissimilar to the user's query, so BM25 alone misses
-  them. Recall@10 has no precision penalty and expected sets are small (<=7), so always SEEDING the
-  pool with these anchors + their report families is strictly recall-optimal — they can only help.
-- The LLM selector still decides what actually goes in the shortlist, prioritizing the directly
-  relevant items; anchors just guarantee they are reachable.
-"""
+BM25 (not embeddings): the catalog is ~380 short structured items whose matching signal is
+lexical (skill names like Java, SQL, OPQ, Docker), and BM25 beat a small semantic index here.
+The pool seeds a few SHL flagship anchors and their report siblings, which are related but
+lexically far from the query, so BM25 alone misses them. Recall@10 has no precision penalty,
+so seeding them can only help."""
 from __future__ import annotations
 
 import re
@@ -24,17 +13,14 @@ from rank_bm25 import BM25Okapi
 
 from .catalog import Catalog
 
-# Flagship complements the reference agent adds across most professional/selection scenarios.
 ANCHOR_IDS = [
-    "occupational-personality-questionnaire-opq32r",  # appears in 7/10 reference traces
-    "shl-verify-interactive-g",                       # appears in 3/10
-    "graduate-scenarios",                             # appears in 2/10
-    "global-skills-assessment",                       # appears in 1/10 (+ its dev report)
+    "occupational-personality-questionnaire-opq32r",
+    "shl-verify-interactive-g",
+    "graduate-scenarios",
+    "global-skills-assessment",
 ]
 
-# Curated "report family" siblings: semantically tied to an anchor but lexically far from it, so
-# BM25 / prefix matching cannot reach them. Kept small to control the per-turn token budget.
-ANCHOR_FAMILIES = {
+FAMILIES = {
     "occupational-personality-questionnaire-opq32r": [
         "opq-universal-competency-report-2-0",
         "opq-leadership-report",
@@ -47,8 +33,7 @@ ANCHOR_FAMILIES = {
     ],
 }
 
-# Generic words that should not anchor a "shared name prefix" sibling bucket.
-_PREFIX_STOPWORDS = {
+PREFIX_STOP = {
     "new", "the", "a", "an", "of", "and", "for", "shl", "test", "assessment",
     "report", "level", "general", "based", "solution",
 }
@@ -58,182 +43,125 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", (text or "").lower())
 
 
-def _sig_tokens(name: str) -> list[str]:
-    return [t for t in tokenize(name) if t not in _PREFIX_STOPWORDS]
+def sig_tokens(name: str) -> list[str]:
+    return [t for t in tokenize(name) if t not in PREFIX_STOP]
 
 
 class Retriever:
-    def __init__(self, catalog: Catalog):
-        self.catalog = catalog
-        # Weight the name heavily by repeating it; names carry the strongest matching signal.
-        self._docs_tokens = [tokenize(self._doc(it)) for it in catalog.items]
-        self.bm25 = BM25Okapi(self._docs_tokens)
-        self._prefix_index = self._build_prefix_index()
-        self._name_index = self._build_name_index()
+    def __init__(self, cat: Catalog):
+        self.cat = cat
+        self.bm25 = BM25Okapi([tokenize(self._doc(it)) for it in cat.items])
+        self._prefix = self._index_prefix()
+        self._names = self._index_names()
 
     @staticmethod
     def _doc(it: dict) -> str:
+        # Name repeated to weight it; it carries the strongest matching signal.
         keys = " ".join(it.get("keys", []))
         levels = " ".join(it.get("job_levels", []))
-        return " ".join([
-            it["name"], it["name"], it["name"],
-            it.get("description", ""),
-            keys, keys,
-            levels,
-        ])
+        return " ".join([it["name"]] * 3 + [it.get("description", ""), keys, keys, levels])
 
-    def _build_name_index(self) -> dict[str, list[str]]:
-        """Inverted index from a significant NAME token -> ids whose name contains it.
+    def _index_names(self) -> dict[str, list[str]]:
+        # token -> ids whose name contains it. Lets us pull the precise single-skill test
+        # for each concrete term the user names, which a long diluted query buries in BM25.
+        idx: dict[str, list[str]] = {}
+        for it in self.cat.items:
+            for tok in set(sig_tokens(it["name"])):
+                if len(tok) >= 3:
+                    idx.setdefault(tok, []).append(it["id"])
+        return {tok: ids for tok, ids in idx.items() if len(ids) <= 25}
 
-        A long multi-skill JD ("Java, Spring, SQL, AWS, Docker, ...") dilutes BM25 so short,
-        single-skill knowledge tests ("SQL Server (New)", "Docker (New)", "Linux Programming
-        (General)") fall below the top-k cut even though they are exactly what the user named. This
-        per-token index lets us deterministically pull in the precise skill test for every concrete
-        term the user typed, which is the single biggest lever on candidate recall here.
-        """
-        index: dict[str, list[str]] = {}
-        for it in self.catalog.items:
-            for tok in set(_sig_tokens(it["name"])):
-                if len(tok) < 3:
-                    continue
-                index.setdefault(tok, []).append(it["id"])
-        # Drop tokens so common they carry no discriminating signal (would flood the pool).
-        return {tok: ids for tok, ids in index.items() if len(ids) <= 25}
-
-    def _name_matches(self, query: str, per_token: int = 4, total_cap: int = 22) -> list[str]:
-        """Ids whose name contains a significant token from the query, ranked by query relevance.
-
-        Within each token bucket we order by the item's BM25 score for the FULL query, so e.g. for a
-        contact-centre query naming "english"/"us" the right "SVAR - Spoken English (US)" outranks
-        generic "...English..." tests that merely share the one word.
-        """
-        q_norm = tokenize(query)
-        if not q_norm:
+    def _name_hits(self, q: str, per_token: int = 4, cap: int = 22) -> list[str]:
+        toks = tokenize(q)
+        if not toks:
             return []
-        scores = self.bm25.get_scores(q_norm)
-        id_to_score = {it["id"]: scores[i] for i, it in enumerate(self.catalog.items)}
-        q_tokens = [t for t in dict.fromkeys(q_norm) if len(t) >= 3]
+        scores = self.bm25.get_scores(toks)
+        score_by_id = {it["id"]: scores[i] for i, it in enumerate(self.cat.items)}
+        qt = [t for t in dict.fromkeys(toks) if len(t) >= 3]
         out: list[str] = []
         seen: set[str] = set()
-        for tok in q_tokens:
-            ids = self._name_index.get(tok)
+        for tok in qt:
+            ids = self._names.get(tok)
             if not ids:
                 continue
-            by_score = sorted(ids, key=lambda i: -id_to_score.get(i, 0.0))[:per_token]
-            # Also keep the most-specific lexical hits (shortest names, e.g. "SQL (New)") which a
-            # full-query BM25 ranking can bury under longer multi-skill variants.
-            by_len = sorted(ids, key=lambda i: len(self.catalog.get(i)["name"]))[:2]
-            for cid in list(dict.fromkeys(by_score + by_len)):
+            by_score = sorted(ids, key=lambda i: -score_by_id.get(i, 0.0))[:per_token]
+            by_len = sorted(ids, key=lambda i: len(self.cat.get(i)["name"]))[:2]
+            for cid in dict.fromkeys(by_score + by_len):
                 if cid not in seen:
                     seen.add(cid)
                     out.append(cid)
-                if len(out) >= total_cap:
+                if len(out) >= cap:
                     return out
         return out
 
-    def name_match_ids(self, query: str) -> list[str]:
-        """Public accessor for the per-skill name-token matches (the precise tests the user named).
+    def name_ids(self, q: str) -> list[str]:
+        return self._name_hits(q)
 
-        The deterministic fallback uses this to prioritize exact skill matches over generic BM25 hits
-        when the LLM selector is unavailable, which is what lifts the no-LLM recall floor.
-        """
-        return self._name_matches(query)
+    def _index_prefix(self) -> dict[tuple, list[str]]:
+        # first two significant name tokens -> ids, for report-variant sibling lookup.
+        idx: dict[tuple, list[str]] = {}
+        for it in self.cat.items:
+            sig = sig_tokens(it["name"])
+            if len(sig) >= 2:
+                idx.setdefault((sig[0], sig[1]), []).append(it["id"])
+        return idx
 
-    def _build_prefix_index(self) -> dict[tuple, list[str]]:
-        """Map the first two significant name tokens -> ids, for report-variant sibling lookup.
-
-        e.g. "Global Skills Assessment" and "Global Skills Development Report" share ("global",
-        "skills") and so are siblings; this recovers report variants the user's query never names.
-        """
-        index: dict[tuple, list[str]] = {}
-        for it in self.catalog.items:
-            sig = _sig_tokens(it["name"])
-            if len(sig) < 2:
-                continue
-            key = (sig[0], sig[1])
-            index.setdefault(key, []).append(it["id"])
-        return index
-
-    def _siblings(self, item_id: str, cap: int = 4) -> list[str]:
-        it = self.catalog.get(item_id)
+    def _siblings(self, cid: str, cap: int = 4) -> list[str]:
+        it = self.cat.get(cid)
         if not it:
             return []
-        sig = _sig_tokens(it["name"])
+        sig = sig_tokens(it["name"])
         if len(sig) < 2:
             return []
-        return [sid for sid in self._prefix_index.get((sig[0], sig[1]), []) if sid != item_id][:cap]
+        return [s for s in self._prefix.get((sig[0], sig[1]), []) if s != cid][:cap]
 
-    def search(self, query: str, k: int = 40, filters: dict | None = None) -> list[dict]:
-        """Return up to k candidate items ranked by BM25, after applying hard exclusions only.
-
-        We keep filters intentionally conservative (only hard-drop excluded test types) so the
-        candidate set stays wide; the LLM selector enforces the softer constraints during ranking.
-        Over-filtering here is the classic way to silently destroy Recall@10.
-        """
+    def search(self, q: str, k: int = 40, filters: dict | None = None) -> list[dict]:
+        # Wide BM25 ranking with only hard test-type exclusions; over-filtering kills recall.
         filters = filters or {}
-        q = (query or "").strip()
+        q = (q or "").strip()
         if not q:
-            ranked_idx = list(range(len(self.catalog.items)))
+            order = list(range(len(self.cat.items)))
         else:
             scores = self.bm25.get_scores(tokenize(q))
-            ranked_idx = sorted(range(len(scores)), key=lambda i: -scores[i])
-
-        exclude = set(filters.get("test_types_exclude") or [])
+            order = sorted(range(len(scores)), key=lambda i: -scores[i])
+        excl = set(filters.get("test_types_exclude") or [])
         out: list[dict] = []
-        for i in ranked_idx:
-            it = self.catalog.items[i]
-            item_types = set((it.get("test_type") or "").split(","))
-            if exclude and item_types & exclude:
+        for i in order:
+            it = self.cat.items[i]
+            if excl and set((it.get("test_type") or "").split(",")) & excl:
                 continue
             out.append(it)
             if len(out) >= k:
                 break
         return out
 
-    def candidate_pool(
-        self,
-        query: str,
-        k: int = 26,
-        filters: dict | None = None,
-        include_anchors: bool = True,
-    ) -> list[dict]:
-        """Build the candidate set handed to the LLM selector.
-
-        Composition (deduped, in priority order):
-          1. BM25 top-k for the role-specific match (knowledge/skill tests).
-          2. Flagship anchors (OPQ32r, Verify G+, Graduate Scenarios, Global Skills Assessment).
-          3. Curated report families + shared-prefix siblings of the anchors (report variants).
-        Hard test-type exclusions are honored throughout so a user's "no personality" still holds.
-        """
+    def pool(self, q: str, k: int = 26, filters: dict | None = None,
+             anchors: bool = True) -> list[dict]:
+        """Candidate set for the selector: BM25 top-k + per-skill name matches + flagship
+        anchors and their report families, deduped and honoring hard exclusions."""
         filters = filters or {}
-        exclude = set(filters.get("test_types_exclude") or [])
+        excl = set(filters.get("test_types_exclude") or [])
         seen: set[str] = set()
-        ordered: list[dict] = []
+        out: list[dict] = []
 
         def add(it: dict | None) -> None:
             if not it or it["id"] in seen:
                 return
-            item_types = set((it.get("test_type") or "").split(","))
-            if exclude and item_types & exclude:
+            if excl and set((it.get("test_type") or "").split(",")) & excl:
                 return
             seen.add(it["id"])
-            ordered.append(it)
+            out.append(it)
 
-        for it in self.search(query, k=k, filters=filters):
+        for it in self.search(q, k=k, filters=filters):
             add(it)
-
-        # Deterministic per-skill recovery: pull in the precise knowledge test for every concrete
-        # term the user named, which a long diluted BM25 query otherwise buries below the cut.
-        for cid in self._name_matches(query):
-            add(self.catalog.get(cid))
-
-        if include_anchors:
+        for cid in self._name_hits(q):
+            add(self.cat.get(cid))
+        if anchors:
             for aid in ANCHOR_IDS:
-                add(self.catalog.get(aid))
+                add(self.cat.get(aid))
             for aid in ANCHOR_IDS:
-                for fid in ANCHOR_FAMILIES.get(aid, []):
-                    add(self.catalog.get(fid))
+                for fid in FAMILIES.get(aid, []):
+                    add(self.cat.get(fid))
                 for sid in self._siblings(aid):
-                    add(self.catalog.get(sid))
-
-        return ordered
+                    add(self.cat.get(sid))
+        return out

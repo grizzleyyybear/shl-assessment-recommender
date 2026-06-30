@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app import agent  # noqa: E402
+from app.agent import Agent  # noqa: E402
 from app.catalog import load_catalog  # noqa: E402
 from app.retrieval import Retriever  # noqa: E402
 from eval.expected import Trace, load_traces  # noqa: E402
@@ -26,7 +26,7 @@ def _norm(url: str) -> str:
     return url.rstrip("/").rstrip(".")
 
 
-def replay(trace: Trace, catalog, retriever, max_turns: int = 8) -> list[dict]:
+def replay(trace: Trace, ag: Agent, max_turns: int = 8) -> list[dict]:
     messages: list[dict] = []
     final_recs: list[dict] = []
     turn_count = 0
@@ -35,7 +35,7 @@ def replay(trace: Trace, catalog, retriever, max_turns: int = 8) -> list[dict]:
             break
         messages.append({"role": "user", "content": user_turn})
         turn_count += 1
-        resp = agent.handle(messages, catalog, retriever)
+        resp = ag.handle(messages)
         messages.append({"role": "assistant", "content": resp["reply"]})
         turn_count += 1
         if resp["recommendations"]:
@@ -55,13 +55,14 @@ def recall_at_k(predicted_urls: list[str], expected_urls: list[str], k: int = 10
 
 
 def run(catalog=None, retriever=None) -> dict:
-    catalog = catalog or load_catalog()
-    retriever = retriever or Retriever(catalog)
+    cat = catalog or load_catalog()
+    ret = retriever or Retriever(cat)
+    ag = Agent(cat, ret)
     traces = load_traces()
     rows = []
     total = 0.0
     for t in traces:
-        recs = replay(t, catalog, retriever)
+        recs = replay(t, ag)
         pred_urls = [r["url"] for r in recs]
         r10 = recall_at_k(pred_urls, t.expected_urls, k=10)
         total += r10

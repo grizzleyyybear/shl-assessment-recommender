@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.catalog import load_catalog
-from app.guardrails import validate_recommendations
+from app.guardrails import Guard
 
 
 def test_catalog_loads_and_has_items():
@@ -29,7 +29,7 @@ def test_validate_drops_hallucinated_urls():
         {"name": real["name"], "url": real["url"], "test_type": real["test_type"]},
         {"name": "Fake Test", "url": "https://www.shl.com/products/product-catalog/view/fake/", "test_type": "K"},
     ]
-    clean = validate_recommendations(recs, catalog)
+    clean = Guard.validate(recs, catalog)
     assert len(clean) == 1
     assert clean[0]["url"] == real["url"]
 
@@ -40,7 +40,7 @@ def test_validate_clamps_to_ten():
         {"name": it["name"], "url": it["url"], "test_type": it["test_type"]}
         for it in catalog.items[:15]
     ]
-    clean = validate_recommendations(recs, catalog)
+    clean = Guard.validate(recs, catalog)
     assert len(clean) == 10
 
 
