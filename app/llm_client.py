@@ -20,8 +20,8 @@ DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 # what keeps a graded deployment from exhausting its daily tokens. Swap to 70B via GROQ_MODEL.
 STATE_MODEL = os.getenv("GROQ_STATE_MODEL", "llama-3.1-8b-instant")
 # Per-call wall clock kept well under the grader's 30s/turn so two calls + retrieval still fit.
-REQUEST_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "12"))
-MAX_ATTEMPTS = int(os.getenv("GROQ_MAX_ATTEMPTS", "3"))
+REQUEST_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "10"))
+MAX_ATTEMPTS = int(os.getenv("GROQ_MAX_ATTEMPTS", "2"))
 
 
 class LLMError(Exception):

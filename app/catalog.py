@@ -24,6 +24,7 @@ class Catalog:
     def __init__(self, items: list[dict]):
         self.items = items
         self.by_id = {it["id"]: it for it in items}
+        self._by_name = {it["name"].strip(): it for it in items}
         self._name_tokens = [(it, _norm_name(it["name"])) for it in items]
 
     def __len__(self) -> int:
@@ -31,6 +32,11 @@ class Catalog:
 
     def get(self, item_id: str) -> dict | None:
         return self.by_id.get(item_id)
+
+    def exact_by_name(self, name: str) -> dict | None:
+        """Exact-name lookup. Used to resolve a shortlist we previously emitted (we control the
+        formatting, so exact match is reliable even for names containing odd unicode)."""
+        return self._by_name.get((name or "").strip())
 
     @staticmethod
     def to_recommendation(item: dict) -> dict:

@@ -73,22 +73,29 @@ async def chat(req: ChatRequest) -> JSONResponse:
             timeout=CHAT_BUDGET_SECONDS,
         )
     except asyncio.TimeoutError:
-        log.warning("chat handler timed out; returning safe fallback")
-        result = {
-            "reply": (
-                "I'm having trouble pulling that together right now. Could you restate the role or "
-                "skills you're hiring for?"
-            ),
-            "recommendations": [],
-            "end_of_conversation": False,
-        }
+        log.warning("chat handler timed out; returning deterministic fallback")
+        try:
+            result = agent.safe_recommend(messages, catalog, retriever)
+        except Exception:  # noqa: BLE001 - last-resort safe shape
+            log.exception("deterministic fallback failed")
+            result = {
+                "reply": (
+                    "I'm having trouble pulling that together right now. Could you restate the role "
+                    "or skills you're hiring for?"
+                ),
+                "recommendations": [],
+                "end_of_conversation": False,
+            }
     except Exception:  # noqa: BLE001 - never 500 the grader
-        log.exception("chat handler crashed; returning safe fallback")
-        result = {
-            "reply": "Sorry, something went wrong on my end. Could you tell me the role you're hiring for?",
-            "recommendations": [],
-            "end_of_conversation": False,
-        }
+        log.exception("chat handler crashed; returning deterministic fallback")
+        try:
+            result = agent.safe_recommend(messages, catalog, retriever)
+        except Exception:  # noqa: BLE001 - last-resort safe shape
+            result = {
+                "reply": "Sorry, something went wrong on my end. Could you tell me the role you're hiring for?",
+                "recommendations": [],
+                "end_of_conversation": False,
+            }
 
     # Validate against the schema before returning; on the off chance it fails, degrade safely.
     validated = ChatResponse(**result)

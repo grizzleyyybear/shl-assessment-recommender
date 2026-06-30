@@ -70,6 +70,11 @@ Hard rules:
   excluded a type, you MUST NOT include any item of that type.
 
 How to choose (this order matters):
+0. MAINTAIN THE BATTERY ACROSS TURNS. If a prior shortlist is given below, treat it as the working
+   set: KEEP all of those items and re-list them, unless the user's latest turn explicitly asks to
+   remove or replace one. A later turn that only asks a question ("is Advanced the right level?"),
+   confirms ("keep Verify G+", "lock it in", "looks good"), or adds something must NOT cause you to
+   drop the previously-established tests. Apply only the specific change the user asked for.
 1. FIRST include every candidate that directly matches the role/skills the user named. If the user
    lists multiple specific skills or technologies (e.g. "Java, Spring, SQL, AWS, Docker"), you MUST
    include the matching test for EACH named skill that appears in the candidate list — do not
@@ -95,6 +100,8 @@ SELECT_USER_TEMPLATE = """<history>
 </history>
 
 Known constraints (already parsed): {constraints}
+
+Previously established shortlist to maintain (keep these unless the user removed them): {prior_shortlist}
 
 Candidate assessments (choose ids from here ONLY):
 {candidates}
