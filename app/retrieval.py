@@ -95,7 +95,18 @@ class Retriever:
         return out
 
     def name_ids(self, q: str) -> list[str]:
-        return self._name_hits(q)
+        # Put exact whole-name skill matches first: if the user typed a term that IS a test's
+        # full name (e.g. "SQL" -> "SQL (New)", "Docker" -> "Docker (New)"), that canonical test
+        # must outrank fuzzy variants (Oracle PL/SQL, SQL Server Integration Services, ...) that
+        # would otherwise crowd it out of the limited recommendation slots.
+        hits = self._name_hits(q)
+        words = set(tokenize(q))
+        exact = [c for c in hits if self._is_named(c, words)]
+        return exact + [c for c in hits if c not in exact]
+
+    def _is_named(self, cid: str, words: set[str]) -> bool:
+        name = re.sub(r"\(.*?\)", "", self.cat.get(cid)["name"]).strip().lower()
+        return bool(name) and (name in words or name.replace(" ", "") in words)
 
     def _index_prefix(self) -> dict[tuple, list[str]]:
         # first two significant name tokens -> ids, for report-variant sibling lookup.

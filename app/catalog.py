@@ -20,6 +20,10 @@ def name_tokens(name: str) -> set[str]:
 class Catalog:
     def __init__(self, items: list[dict]):
         self.items = items
+        for it in items:
+            # Collapse stray whitespace/newlines in names so the shortlist marker (newline
+            # delimited) survives carry-forward and we never emit a multi-line name.
+            it["name"] = re.sub(r"\s+", " ", it["name"]).strip()
         self.by_id = {it["id"]: it for it in items}
         self._by_name = {it["name"].strip(): it for it in items}
         self._tokens = [(it, name_tokens(it["name"])) for it in items]

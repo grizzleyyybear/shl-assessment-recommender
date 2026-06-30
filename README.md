@@ -49,22 +49,22 @@ Response:
 
 ```
 POST /chat
-  -> derive_state()        # LLM (+ deterministic fallback): intent, constraints, search query
+  -> StateReader.read()    # LLM (+ deterministic fallback): intent, constraints, search query
   -> route on intent       # clarify | recommend | refine | compare | off_topic | injection | closing
        recommend/refine:    # the SET is built deterministically from raw user text:
          carry-forward prior battery  # prepend last turn's shortlist so refines only ADD, never drop it
          per-skill name-token matches # the exact test for every skill the user named (SQL, Docker, …)
          diverse BM25 coverage        # query-relevant pool, family-diversity capped
-         _augment_with_anchors()      # guarantee OPQ32r + Verify G+ (in 7/10 & 3/10 reference sets)
+         anchors                      # guarantee OPQ32r + Verify G+ (in 7/10 & 3/10 reference sets)
          + LLM reply / leftover-slot picks   # model writes the reply; may only fill empty slots
        compare:
-         catalog.match_by_name() -> grounded compare over catalog facts only
-  -> guardrails.validate_recommendations()   # drop anything not in the catalog, clamp to 10
+         Catalog.match_by_name() -> grounded compare over catalog facts only
+  -> Guard.validate()   # drop anything not in the catalog, clamp to 10
 ```
 
 Key design choices (rationale in `APPROACH.md`):
 - **Retrieval is the source of truth for the set** — I measured an LLM ID-only selector at ≈0.53–0.58
-  Mean Recall@10 vs **0.70** for the deterministic assembly (the model under-covers named skills and
+  Mean Recall@10 vs **0.73** for the deterministic assembly (the model under-covers named skills and
   its derived constraints perturb retrieval). So retrieval owns the shortlist and the LLM owns the
   conversation + any leftover-slot extension. This makes the headline metric independent of free-tier
   LLM latency/rate-limits.
@@ -73,7 +73,9 @@ Key design choices (rationale in `APPROACH.md`):
 - **BM25 + per-skill name-token retrieval, no embedding model** — on this lexical catalog BM25 beat a
   `bge-small` semantic index in offline tests (0.51 vs 0.42 candidate recall@15), so we skip the
   ~400MB model and its cold-start cost. A name-token index additionally guarantees the exact test for
-  every concrete skill the user names (SQL, Docker, …), lifting candidate recall to ~0.86.
+  every concrete skill the user names (SQL, Docker, …), and exact whole-name matches are ranked ahead
+  of fuzzy variants so the canonical test is never crowded out — lifting candidate recall to ~0.86 and
+  realized Mean Recall@10 to 0.73.
 - **Anchors + report families** — the reference traces consistently complement role-specific tests
   with SHL flagships (OPQ32r, Verify G+, Graduate Scenarios) and their report variants. We seed the
   candidate pool with these and deterministically guarantee the two most frequent ones.
@@ -83,7 +85,7 @@ Key design choices (rationale in `APPROACH.md`):
 - **Stateless re-derivation** — every turn rebuilds cumulative constraints from the whole history,
   so "refine" needs no special machinery and the service survives the grader's independent calls.
 - **Deterministic everywhere** — the set is built without the LLM and every LLM call has a fallback,
-  so a full replay with the selector fully rate-limited still scores the same **mean Recall@10 = 0.70**
+  so a full replay with the selector fully rate-limited still scores the same **mean Recall@10 = 0.73**
   (6/6 behavior probes pass), and the service never 500s or returns an empty shortlist within budget.
 
 ## Run locally

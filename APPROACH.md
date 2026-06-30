@@ -115,10 +115,14 @@ A replay harness feeds each reference conversation's user turns through the agen
 Recall@10 against the final shortlist; a behavior-probe suite checks clarify / off-topic / injection
 / refine / compare / turn-cap handling. I measured candidate recall (the ceiling) separately from
 realized recall so I always knew whether a miss was a retrieval or a selection problem.
-- **Mean Recall@10 = 0.699** across the 10 public traces — and because the set is deterministic, this
+- **Mean Recall@10 = 0.727** across the 10 public traces — and because the set is deterministic, this
   is the realized score *and* the guaranteed worst case: a full end-to-end replay with **every** LLM
-  selection call rate-limited produced the identical 0.699. Per-trace: C6/C10 = 1.0, C4/C8 = 0.8,
-  C3 = 0.75, C1 = 0.67, C2 = 0.6, C9 = 0.57, C5/C7 = 0.4.
+  selection call rate-limited produced the identical 0.727. Per-trace: C6/C10 = 1.0, C9 = 0.86,
+  C4/C8 = 0.8, C3 = 0.75, C1 = 0.67, C2 = 0.6, C5/C7 = 0.4.
+- **Exact-named-skill priority:** when the user types a term that *is* a test's full name (e.g. "SQL"
+  → "SQL (New)", "Docker" → "Docker (New)"), that canonical test is ranked ahead of fuzzy variants
+  (Oracle PL/SQL, SQL Server Integration Services, …) so it is never crowded out of the limited slots.
+  This lifted C9 from 0.57 to 0.86 and the mean from 0.699 to 0.727 with no regressions.
 - **Behavior probes: 6/6 pass**, including under induced LLM failure (deterministic routing fallback).
 - **Candidate-recall ceiling = 0.86**; the remaining floor-to-ceiling gap is semantic (role→skill
   inference, e.g. C5/C7) that a lexical pool cannot reach — see §10.
@@ -130,8 +134,10 @@ keep larger models swappable via `GROQ_MODEL` (and `GROQ_SELECT_MODEL`, which le
 a separate per-minute token bucket). Critically, because retrieval — not the model — owns the
 recommendation set (§4), token budget is a **conversation-quality** lever, not a recall risk: if the
 8B calls rate-limit during grading, routing and the shortlist both fall back deterministically and
-Recall@10 is unchanged (0.699). Per-call timeout (10s) and attempt caps keep two LLM calls + retrieval
-comfortably inside the 26s `/chat` budget.
+Recall@10 is unchanged (0.727). To cut that risk further, when the deterministic floor already fills
+all 10 slots the agent skips the heavy candidate block and asks only for the natural-language reply
+with a compact prompt, so the common case rarely hits the per-minute limit. Per-call timeout (10s) and
+attempt caps keep two LLM calls + retrieval comfortably inside the 26s `/chat` budget.
 
 ## 9. What I tried that didn't make the cut
 - **Local sentence-embeddings (bge-small / fastembed):** worse candidate recall than BM25 on this

@@ -11,7 +11,14 @@ import re
 from .catalog import Catalog
 from .guardrails import Guard
 from .llm_client import Llm, LlmError
-from .prompts import COMPARE_SYSTEM, COMPARE_USER, SELECT_SYSTEM, SELECT_USER
+from .prompts import (
+    COMPARE_SYSTEM,
+    COMPARE_USER,
+    REPLY_SYSTEM,
+    REPLY_USER,
+    SELECT_SYSTEM,
+    SELECT_USER,
+)
 from .retrieval import ANCHOR_IDS, Retriever
 from .state import State, StateReader, fmt_history, user_text
 
@@ -166,11 +173,48 @@ class Agent:
 
     # --- recommend / refine --------------------------------------------------------------------
     def _recommend(self, st: State, msgs: list[dict]) -> tuple[str, list[dict]]:
+        excl = set((st.cons or {}).get("test_types_exclude") or [])
+
+        # The deterministic floor owns the SET. Build it first so we know whether any slot is
+        # still open for the LLM to fill.
+        recs = self._floor(msgs, excl=excl)
+
+        if len(recs) >= 10:
+            # No open slots: ask only for the natural-language reply with a tiny prompt. This
+            # avoids the heavy candidate block, so the common case rarely hits a rate limit.
+            reply = self._write_reply(msgs, recs)
+        else:
+            reply = self._select_fill(st, msgs, recs, excl)
+
+        if not reply:
+            reply = "Here are SHL assessments that fit what you've described."
+        if recs:
+            reply = f"{reply}\n\n{self._marker(recs)}"
+        return reply, recs
+
+    def _write_reply(self, msgs: list[dict], recs: list[dict]) -> str:
+        try:
+            raw = self.llm.chat(
+                REPLY_SYSTEM,
+                REPLY_USER.format(
+                    history=fmt_history(msgs),
+                    shortlist="; ".join(r["name"] for r in recs),
+                ),
+                model=self.llm.select_model,
+                temp=0.3,
+                max_tokens=200,
+            )
+            return str(raw.get("reply", "") or "").strip()
+        except LlmError:
+            log.warning("reply LLM call failed; using template")
+            return ""
+
+    def _select_fill(self, st: State, msgs: list[dict], recs: list[dict], excl: set[str]) -> str:
+        # Floor left open slots: let the LLM both write the reply and fill the remainder from a
+        # candidate block (it can never displace the floor, only extend it).
         q = " ".join(p for p in (user_text(msgs), st.query) if p).strip()
         cands = self.ret.pool(q, k=24, filters=st.cons)
         prior = self._prior(msgs)
-        excl = set((st.cons or {}).get("test_types_exclude") or [])
-
         ids_in = {it["id"] for it in cands}
         for it in prior:
             if it["id"] not in ids_in:
@@ -203,7 +247,6 @@ class Agent:
         except LlmError:
             log.warning("select LLM call failed; using deterministic floor only")
 
-        recs = self._floor(msgs, excl=excl)
         urls = {r["url"] for r in recs}
         for cid in ids:
             if len(recs) >= 10:
@@ -217,12 +260,7 @@ class Agent:
                 continue
             recs.append(Catalog.to_rec(it))
             urls.add(it["url"])
-
-        if not reply:
-            reply = "Here are SHL assessments that fit what you've described."
-        if recs:
-            reply = f"{reply}\n\n{self._marker(recs)}"
-        return reply, recs
+        return reply
 
     # --- grounded compare ----------------------------------------------------------------------
     def _compare(self, st: State, msgs: list[dict]) -> tuple[str, list[dict]]:
