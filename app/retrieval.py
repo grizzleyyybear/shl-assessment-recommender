@@ -131,6 +131,14 @@ class Retriever:
                     return out
         return out
 
+    def name_match_ids(self, query: str) -> list[str]:
+        """Public accessor for the per-skill name-token matches (the precise tests the user named).
+
+        The deterministic fallback uses this to prioritize exact skill matches over generic BM25 hits
+        when the LLM selector is unavailable, which is what lifts the no-LLM recall floor.
+        """
+        return self._name_matches(query)
+
     def _build_prefix_index(self) -> dict[tuple, list[str]]:
         """Map the first two significant name tokens -> ids, for report-variant sibling lookup.
 

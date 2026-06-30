@@ -168,10 +168,19 @@ def safe_recommend(
         if len(recs) >= _FALLBACK_TARGET:
             break
         _add(it)
-    bm25_pool = [it for it in candidates if it["id"] not in ANCHOR_IDS]
-    for it in bm25_pool:
+
+    # Prioritize the precise per-skill name matches (the exact tests the user named) ahead of generic
+    # BM25 hits — these are the items the selector would have picked first, so leading with them is
+    # what lifts the no-LLM recall floor.
+    name_ids = retriever.name_match_ids(query)
+    ordered = [catalog.get(i) for i in name_ids if catalog.get(i)] + [
+        it for it in candidates if it["id"] not in ANCHOR_IDS and it["id"] not in name_ids
+    ]
+    for it in ordered:
         if len(recs) >= _FALLBACK_TARGET:
             break
+        if not it:
+            continue
         toks = re.findall(r"[a-z0-9]+", it["name"].lower())
         fam = toks[0] if toks else it["id"]
         if family_count.get(fam, 0) >= 2:
@@ -286,7 +295,11 @@ def _recommend(
     # BM25 top-N is dominated by near-duplicate variants (e.g. seven "Java ..." tests) that bury the
     # other named skills (SQL, AWS, Docker); capping items per leading term surfaces them.
     if not llm_ok and len(recs) < _FALLBACK_TARGET:
-        bm25_pool = [it for it in candidates if it["id"] not in ANCHOR_IDS]
+        name_ids = retriever.name_match_ids(query)
+        # Lead with the precise per-skill name matches, then the rest of the BM25 pool.
+        bm25_pool = [catalog.get(i) for i in name_ids if catalog.get(i)] + [
+            it for it in candidates if it["id"] not in ANCHOR_IDS and it["id"] not in name_ids
+        ]
         anchor_pool = [it for it in candidates if it["id"] in ANCHOR_IDS]
         family_count: dict[str, int] = {}
         for it in recs:
@@ -296,7 +309,7 @@ def _recommend(
         for it in bm25_pool:
             if len(recs) >= _FALLBACK_TARGET:
                 break
-            if it["url"] in have_urls:
+            if not it or it["url"] in have_urls:
                 continue
             toks = re.findall(r"[a-z0-9]+", it["name"].lower())
             fam = toks[0] if toks else it["id"]
