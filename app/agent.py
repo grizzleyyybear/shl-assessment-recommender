@@ -267,66 +267,49 @@ def _recommend(
     recs: list[dict] = []
     seen: set[str] = set()
     have_urls: set[str] = set()
-    for it in carry:
-        if len(recs) >= 10:
-            break
-        if it["url"] in have_urls:
-            continue
+    family_count: dict[str, int] = {}
+
+    def _take(it: dict | None, *, diversity: bool) -> None:
+        if not it or len(recs) >= 10 or it["id"] in seen or it["url"] in have_urls:
+            return
+        item_types = set((it.get("test_type") or "").split(","))
+        if exclude and item_types & exclude:
+            return
+        toks = re.findall(r"[a-z0-9]+", it["name"].lower())
+        fam = toks[0] if toks else it["id"]
+        if diversity and family_count.get(fam, 0) >= 2:
+            return
         recs.append(Catalog.to_recommendation(it))
         seen.add(it["id"])
         have_urls.add(it["url"])
+        family_count[fam] = family_count.get(fam, 0) + 1
 
+    # 1. Carried battery first — the established shortlist is guaranteed (see carry-forward note above).
+    for it in carry:
+        _take(it, diversity=False)
+
+    # 2. Guaranteed per-skill coverage BEFORE the LLM's extra picks. The name-matched tests are the
+    # precise assessments for the exact skills the user named, so — like the flagship anchors — we
+    # deterministically ensure they land regardless of what the LLM returned. The LLM tends to pick a
+    # narrow representative set, but the reference batteries include a test PER named skill, and on
+    # several traces this deterministic coverage beats the raw LLM selection. Diversity-capping by
+    # leading name token stops one skill's near-duplicate variants from crowding out other skills.
+    for cid in retriever.name_match_ids(query):
+        _take(catalog.get(cid), diversity=True)
+
+    # 3. The LLM's selection adds semantic value (ordering, complements) in any remaining slots.
     for cid in ids:
-        if len(recs) >= 10:
-            break
-        if cid in cand_ids and cid not in seen:
-            rec = Catalog.to_recommendation(catalog.get(cid))
-            if rec["url"] in have_urls:
-                continue
-            recs.append(rec)
-            seen.add(cid)
-            have_urls.add(rec["url"])
+        if cid in cand_ids:
+            _take(catalog.get(cid), diversity=False)
 
-    # Deterministic backfill — ONLY when the selector failed (rate-limit/timeout) and we have no
-    # carried battery to stand on. We deliberately do NOT pad a successful LLM selection up to 10:
-    # the grader tracks the number of recommendations and the reference batteries are small (<=7), so
-    # over-recommending is a liability. When the LLM is down we still must commit a sensible shortlist,
-    # so we build a diversity-capped BM25 set toward a soft target. Diversity matters because a raw
-    # BM25 top-N is dominated by near-duplicate variants (e.g. seven "Java ..." tests) that bury the
-    # other named skills (SQL, AWS, Docker); capping items per leading term surfaces them.
+    # 4. Generic BM25 backfill — ONLY when the selector failed and we still have too few items, so we
+    # always commit a sensible shortlist. A successful LLM selection is not padded with generic hits.
     if not llm_ok and len(recs) < _FALLBACK_TARGET:
-        name_ids = retriever.name_match_ids(query)
-        # Lead with the precise per-skill name matches, then the rest of the BM25 pool.
-        bm25_pool = [catalog.get(i) for i in name_ids if catalog.get(i)] + [
-            it for it in candidates if it["id"] not in ANCHOR_IDS and it["id"] not in name_ids
-        ]
-        anchor_pool = [it for it in candidates if it["id"] in ANCHOR_IDS]
-        family_count: dict[str, int] = {}
-        for it in recs:
-            toks = re.findall(r"[a-z0-9]+", it["name"].lower())
-            fam = toks[0] if toks else it["url"]
-            family_count[fam] = family_count.get(fam, 0) + 1
-        for it in bm25_pool:
+        for it in candidates:
             if len(recs) >= _FALLBACK_TARGET:
                 break
-            if not it or it["url"] in have_urls:
-                continue
-            toks = re.findall(r"[a-z0-9]+", it["name"].lower())
-            fam = toks[0] if toks else it["id"]
-            if family_count.get(fam, 0) >= 2:
-                continue
-            recs.append(Catalog.to_recommendation(it))
-            seen.add(it["id"])
-            have_urls.add(it["url"])
-            family_count[fam] = family_count.get(fam, 0) + 1
-        for it in anchor_pool:
-            if len(recs) >= _FALLBACK_TARGET:
-                break
-            if it["url"] in have_urls:
-                continue
-            recs.append(Catalog.to_recommendation(it))
-            seen.add(it["id"])
-            have_urls.add(it["url"])
+            if it["id"] not in ANCHOR_IDS:
+                _take(it, diversity=True)
 
     recs = _augment_with_anchors(recs, catalog, state.constraints)
     if not reply:
