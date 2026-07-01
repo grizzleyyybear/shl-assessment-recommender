@@ -64,7 +64,7 @@ POST /chat
 
 Key design choices (rationale in `APPROACH.md`):
 - **Retrieval is the source of truth for the set** — I measured an LLM ID-only selector at ≈0.53–0.58
-  Mean Recall@10 vs **0.73** for the deterministic assembly (the model under-covers named skills and
+  Mean Recall@10 vs **0.74** for the deterministic assembly (the model under-covers named skills and
   its derived constraints perturb retrieval). So retrieval owns the shortlist and the LLM owns the
   conversation + any leftover-slot extension. This makes the headline metric independent of free-tier
   LLM latency/rate-limits.
@@ -75,7 +75,7 @@ Key design choices (rationale in `APPROACH.md`):
   ~400MB model and its cold-start cost. A name-token index additionally guarantees the exact test for
   every concrete skill the user names (SQL, Docker, …), and exact whole-name matches are ranked ahead
   of fuzzy variants so the canonical test is never crowded out — lifting candidate recall to ~0.86 and
-  realized Mean Recall@10 to 0.73.
+  realized Mean Recall@10 to 0.74.
 - **Anchors + report families** — the reference traces consistently complement role-specific tests
   with SHL flagships (OPQ32r, Verify G+, Graduate Scenarios) and their report variants. We seed the
   candidate pool with these and deterministically guarantee the two most frequent ones.
@@ -85,7 +85,7 @@ Key design choices (rationale in `APPROACH.md`):
 - **Stateless re-derivation** — every turn rebuilds cumulative constraints from the whole history,
   so "refine" needs no special machinery and the service survives the grader's independent calls.
 - **Deterministic everywhere** — the set is built without the LLM and every LLM call has a fallback,
-  so a full replay with the selector fully rate-limited still scores the same **mean Recall@10 = 0.73**
+  so a full replay with the selector fully rate-limited still scores the same **mean Recall@10 = 0.74**
   (6/6 behavior probes pass), and the service never 500s or returns an empty shortlist within budget.
 
 ## Run locally

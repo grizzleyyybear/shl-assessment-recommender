@@ -105,8 +105,13 @@ class Retriever:
         return exact + [c for c in hits if c not in exact]
 
     def _is_named(self, cid: str, words: set[str]) -> bool:
-        name = re.sub(r"\(.*?\)", "", self.cat.get(cid)["name"]).strip().lower()
-        return bool(name) and (name in words or name.replace(" ", "") in words)
+        name = self.cat.get(cid)["name"]
+        base = re.sub(r"\(.*?\)", "", name).strip().lower()
+        if base and (base in words or base.replace(" ", "") in words):
+            return True
+        # A parenthetical acronym (e.g. "(AWS)", "(SSIS)") is how the user usually names these;
+        # match those too. All-caps + length 3-6 excludes the ubiquitous "(New)" suffix.
+        return any(m.lower() in words for m in re.findall(r"\(([A-Z0-9]{3,6})\)", name))
 
     def _index_prefix(self) -> dict[tuple, list[str]]:
         # first two significant name tokens -> ids, for report-variant sibling lookup.
