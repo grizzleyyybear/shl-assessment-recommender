@@ -23,6 +23,8 @@ def main() -> None:
     retriever = Retriever(catalog)
 
     recall = replay_harness.run(catalog, retriever)
+    pool = replay_harness.pool_recall(catalog, retriever)
+    ground = replay_harness.groundedness(catalog, retriever)
     probes = behavior_probes.run(catalog, retriever)
 
     lines = []
@@ -31,7 +33,20 @@ def main() -> None:
     lines.append(f"_Generated: {datetime.now().isoformat(timespec='seconds')}_")
     lines.append(f"_Catalog items: {len(catalog)}_")
     lines.append("")
-    lines.append("## Recall@10 (deterministic replay of provided traces)")
+    lines.append("The suite measures the four things the brief asks for:")
+    lines.append("")
+    lines.append("| Measure | Metric | Score |")
+    lines.append("|---------|--------|-------|")
+    lines.append(f"| Retrieval quality | Mean candidate-pool recall (ceiling) | "
+                 f"**{pool['mean_pool_recall']:.3f}** |")
+    lines.append(f"| Recommendation relevance | Mean Recall@10 vs reference shortlists | "
+                 f"**{recall['mean_recall@10']:.3f}** |")
+    lines.append(f"| Groundedness | Returned URLs resolving to catalog entries | "
+                 f"**{ground['groundedness']:.3f}** ({ground['grounded']}/{ground['recommendations']}) |")
+    lines.append(f"| Response accuracy | Behavior-probe pass rate | "
+                 f"**{probes['pass_rate']:.3f}** |")
+    lines.append("")
+    lines.append("## Recommendation relevance — Recall@10 (deterministic replay of provided traces)")
     lines.append("")
     lines.append("| Trace | Recall@10 | Hits | Expected | Returned |")
     lines.append("|-------|-----------|------|----------|----------|")
@@ -42,7 +57,25 @@ def main() -> None:
         )
     lines.append(f"| **Mean** | **{recall['mean_recall@10']:.3f}** | | | |")
     lines.append("")
-    lines.append("## Behavior probes")
+    lines.append("## Retrieval quality — candidate-pool recall (the ceiling the selector can't exceed)")
+    lines.append("")
+    lines.append("| Trace | Pool recall | Found | Expected |")
+    lines.append("|-------|-------------|-------|----------|")
+    for row in pool["rows"]:
+        lines.append(
+            f"| {row['trace']} | {row['pool_recall']:.3f} | {row['found']} | {row['expected']} |"
+        )
+    lines.append(f"| **Mean** | **{pool['mean_pool_recall']:.3f}** | | |")
+    lines.append("")
+    lines.append("## Groundedness")
+    lines.append("")
+    lines.append(
+        f"{ground['grounded']}/{ground['recommendations']} returned recommendations resolve to a "
+        f"real catalog entry (**{ground['groundedness']:.3f}**). URLs are projected from the catalog "
+        f"by ID, so a hallucinated link is structurally impossible."
+    )
+    lines.append("")
+    lines.append("## Response accuracy — behavior probes")
     lines.append("")
     lines.append("| Probe | Result | Assertion |")
     lines.append("|-------|--------|-----------|")

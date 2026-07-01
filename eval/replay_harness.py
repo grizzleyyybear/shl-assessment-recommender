@@ -15,8 +15,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.agent import Agent  # noqa: E402
+from app.bundles import Bundles  # noqa: E402
 from app.catalog import load_catalog  # noqa: E402
-from app.retrieval import Retriever  # noqa: E402
+from app.retrieval import ANCHOR_IDS, Retriever  # noqa: E402
 from eval.expected import Trace, load_traces  # noqa: E402
 
 THROTTLE_SECONDS = float(os.getenv("EVAL_THROTTLE", "1.2"))
@@ -76,6 +77,49 @@ def run(catalog=None, retriever=None) -> dict:
         })
     mean = total / len(traces) if traces else 0.0
     return {"rows": rows, "mean_recall@10": round(mean, 3)}
+
+
+def pool_recall(catalog=None, retriever=None, k: int = 40) -> dict:
+    """Retrieval quality: does the candidate pool even CONTAIN the expected items, independent of
+    the final 10-slot selection? This is the ceiling the selector can never exceed, so we track it
+    separately from realized Recall@10 to tell retrieval misses apart from selection misses."""
+    cat = catalog or load_catalog()
+    ret = retriever or Retriever(cat)
+    bundles = Bundles(cat)
+    rows = []
+    total = 0.0
+    for t in load_traces():
+        ids: set[str] = set(ANCHOR_IDS)
+        for q in [*t.user_turns, " ".join(t.user_turns)]:
+            ids.update(it["id"] for it in ret.pool(q, k=k))
+            ids.update(ret.name_ids(q))
+            ids.update(bundles.promote(q))
+        cand_urls = {_norm(cat.get(i)["url"]) for i in ids if cat.get(i)}
+        exp = {_norm(u) for u in t.expected_urls}
+        recall = 1.0 if not exp else len(cand_urls & exp) / len(exp)
+        total += recall
+        rows.append({"trace": t.name, "pool_recall": round(recall, 3),
+                     "found": len(cand_urls & exp), "expected": len(exp)})
+    mean = total / len(rows) if rows else 0.0
+    return {"rows": rows, "mean_pool_recall": round(mean, 3)}
+
+
+def groundedness(catalog=None, retriever=None) -> dict:
+    """Every returned recommendation's URL/name/test_type is projected from the catalog, never
+    emitted by the LLM, so a fabricated link is structurally impossible. We verify it end-to-end:
+    across every trace's final shortlist, each returned URL must resolve to a real catalog entry."""
+    cat = catalog or load_catalog()
+    ret = retriever or Retriever(cat)
+    ag = Agent(cat, ret)
+    total = 0
+    grounded = 0
+    for t in load_traces():
+        for rec in replay(t, ag):
+            total += 1
+            if cat.has_url(rec["url"]):
+                grounded += 1
+    rate = 1.0 if total == 0 else grounded / total
+    return {"recommendations": total, "grounded": grounded, "groundedness": round(rate, 3)}
 
 
 if __name__ == "__main__":
