@@ -3,9 +3,14 @@ services:
     name: shl-recommender
     runtime: docker
     plan: free
+    autoDeploy: true
     healthCheckPath: /health
     envVars:
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL
         value: llama-3.1-8b-instant
+      - key: GROQ_TIMEOUT
+        value: "10"
+      - key: CHAT_BUDGET_SECONDS
+        value: "26"
