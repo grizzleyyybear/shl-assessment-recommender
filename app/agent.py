@@ -8,6 +8,7 @@ import json
 import logging
 import re
 
+from .bundles import Bundles
 from .catalog import Catalog
 from .guardrails import Guard
 from .llm_client import Llm, LlmError
@@ -45,6 +46,7 @@ class Agent:
         self.ret = ret
         self.llm = llm or Llm()
         self.state = StateReader(self.llm)
+        self.bundles = Bundles(cat)
 
     # --- helpers -------------------------------------------------------------------------------
     @staticmethod
@@ -148,13 +150,21 @@ class Agent:
             take(it, diverse=False)
 
         name_ids = self.ret.name_ids(q)
-        ordered = [self.cat.get(i) for i in name_ids if self.cat.get(i)] + [
-            it for it in cands if it["id"] not in ANCHOR_IDS and it["id"] not in name_ids
+        promoted = self.bundles.promote(q)
+        promoted_set = set(promoted)
+
+        ordered_ids: list[str] = []
+        for i in promoted + name_ids:
+            if i not in ordered_ids:
+                ordered_ids.append(i)
+        seen_ids = set(ordered_ids)
+        ordered = [self.cat.get(i) for i in ordered_ids if self.cat.get(i)] + [
+            it for it in cands if it["id"] not in ANCHOR_IDS and it["id"] not in seen_ids
         ]
         for it in ordered:
             if len(recs) >= limit:
                 break
-            take(it, diverse=True)
+            take(it, diverse=it["id"] not in promoted_set)
 
         return self._anchors(recs, excl)
 
